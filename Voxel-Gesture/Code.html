@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gesture‑Driven Voxel Space</title>
+  <style>
+    body { margin: 0; overflow: hidden; background:#000; color:#0f0; font-family: system-ui; }
+    #hud {
+      position: fixed; top: 10px; left: 10px; padding: 6px 10px;
+      background: rgba(0,0,0,.6); border-radius: 4px; font-size: 14px;
+    }
+    video { display: none; } /* hide webcam feed; show only 3D */
+  </style>
+</head>
+<body>
+<div id="hud">Mode: BUILD | Gesture: none</div>
+<video id="video" playsinline></video>
+<canvas id="three-canvas"></canvas>
+
+<script type="module">
+  // === Imports (CDN) ===
+  import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
+  import { Hands } from 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js';
+  import { Camera } from 'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js'; // [web:229]
+
+  const hud = document.getElementById('hud');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('three-canvas');
+
+  // === THREE.JS SCENE ===
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050509);
+
+  const camera3D = new THREE.PerspectiveCamera(
+    60, window.innerWidth / window.innerHeight, 0.1, 1000
+  );
+  camera3D.position.set(0, 15, 30);
+
+  const light = new THREE.DirectionalLight(0xffffff, 1.2);
+  light.position.set(10, 20, 10);
+  scene.add(light, new THREE.AmbientLight(0x404040));
+
+  // voxel grid
+  const voxelSize = 1;
+  const gridSize = 20;
+  const voxels = new Map(); // key "x,y,z" -> mesh
+
+  const voxelGeom = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+  const voxelMat = new THREE.MeshStandardMaterial({ color: 0x00ffff });
+
+  function voxelKey(x, y, z) { return `${x},${y},${z}`; }
+
+  function addVoxel(ix, iy, iz, color = 0x00ffff) {
+    const key = voxelKey(ix, iy, iz);
+    if (voxels.has(key)) return;
+    const mat = voxelMat.clone();
+    mat.color.setHex(color);
+    const mesh = new THREE.Mesh(voxelGeom, mat);
+    mesh.position.set(ix * voxelSize, iy * voxelSize, iz * voxelSize);
+    scene.add(mesh);
+    voxels.set(key, mesh);
+  }
+
+  function removeVoxel(ix, iy, iz) {
+    const key = voxelKey(ix, iy, iz);
+    const mesh = voxels.get(key);
+    if (!mesh) return;
+    scene.remove(mesh);
+    voxels.delete(key);
+  }
+
+  function collapseWorld() {
+    voxels.forEach(m => {
+      m.position.y -= 0.3 * Math.random() * gridSize;
+      m.material.color.setHex(0xff4080);
+    });
+  }
+
+  function chaosMode() {
+    voxels.forEach(m => {
+      m.position.x += (Math.random() - 0.5) * 5;
+      m.position.y += (Math.random() - 0.5) * 5;
+      m.position.z += (Math.random() - 0.5) * 5;
+      m.material.color.offsetHSL(Math.random() * 0.2, 0, 0);
+    });
+  }
+
+  // === GESTURE STATE ===
+  const STATE = {
+    mode: 'BUILD', // BUILD | ERASE
+    gesture: 'none'
+  };
+
+  function updateHUD() {
+    hud.textContent = `Mode: ${STATE.mode} | Gesture: ${STATE.gesture}`;
+  }
+
+  // === HAND + GESTURE LOGIC (MediaPipe) ===
+  const hands = new Hands({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7,
+  }); // [web:62]
+
+  hands.onResults(onResults);
+
+  const cameraFeed = new Camera(video, {
+    onFrame: async () => {
+      await hands.send({ image: video });
+    },
+    width: 640,
+    height: 480
+  });
+
+  cameraFeed.start();
+
+  function normToWorld(x, y, z = 0) {
+    // map normalized (0‑1) to our voxel world
+    const wx = (x - 0.5) * gridSize;
+    const wz = (y - 0.5) * gridSize;
+    const wy = (1 - z) * (gridSize * 0.5);
+    return new THREE.Vector3(wx, wy, wz);
+  }
+
+  function detectGestures(landmarksList) {
+    // one or two hands
+    if (!landmarksList || landmarksList.length === 0) {
+      STATE.gesture = 'none';
+      return;
+    }
+
+    const main = landmarksList[0];
+    const thumbTip = main[4];
+    const indexTip = main[8];
+    const middleTip = main[12];
+
+    const dx = thumbTip.x - indexTip.x;
+    const dy = thumbTip.y - indexTip.y;
+    const pinchDist = Math.hypot(dx, dy);
+
+    const fx = indexTip.x - middleTip.x;
+    const fy = indexTip.y - middleTip.y;
+    const spread = Math.hypot(fx, fy);
+
+    const twoHands = landmarksList.length === 2;
+
+    // basic gesture rules (tune thresholds) [web:225][web:229]
+    if (pinchDist < 0.03) {
+      STATE.gesture = 'pinch';
+    } else if (spread < 0.02) {
+      STATE.gesture = 'fist';
+    } else if (twoHands) {
+      STATE.gesture = 'two_palms';
+    } else {
+      STATE.gesture = 'open';
+    }
+  }
+
+  let lastActionTime = 0;
+
+  function onResults(results) {
+    const now = performance.now();
+    const handsLm = results.multiHandLandmarks;
+    detectGestures(handsLm);
+
+    if (!handsLm || handsLm.length === 0) {
+      updateHUD();
+      return;
+    }
+
+    const activeHand = handsLm[0];
+    const indexTip = activeHand[8];
+    const worldPos = normToWorld(indexTip.x, indexTip.y, indexTip.z);
+
+    const ix = Math.round(worldPos.x / voxelSize);
+    const iy = Math.round(worldPos.y / voxelSize);
+    const iz = Math.round(worldPos.z / voxelSize);
+
+    // rate limit heavy actions
+    const cool = (ms) => now - lastActionTime > ms;
+
+    switch (STATE.gesture) {
+      case 'pinch': // create voxel
+        if (cool(120)) {
+          addVoxel(ix, iy, iz);
+          lastActionTime = now;
+        }
+        STATE.mode = 'BUILD';
+        break;
+      case 'fist': // erase voxel
+        if (cool(120)) {
+          removeVoxel(ix, iy, iz);
+          lastActionTime = now;
+        }
+        STATE.mode = 'ERASE';
+        break;
+      case 'two_palms': // rotate the world
+        scene.rotation.y += 0.02;
+        break;
+      case 'open':
+        STATE.mode = 'BUILD';
+        break;
+    }
+
+    // “one sign” & “chaos mode” — map to global hotkeys (for demo)
+    if (STATE.gesture === 'open' && cool(1500)) {
+      // treat very high index tip as “gravity collapse”
+      if (indexTip.y < 0.25) {
+        collapseWorld();
+        lastActionTime = now;
+      } else if (indexTip.y > 0.75) {
+        chaosMode();
+        lastActionTime = now;
+      }
+    }
+
+    updateHUD();
+  }
+
+  // === RENDER LOOP ===
+  function animate() {
+    requestAnimationFrame(animate);
+    renderer.render(scene, camera3D);
+  }
+  animate();
+
+  window.addEventListener('resize', () => {
+    camera3D.aspect = window.innerWidth / window.innerHeight;
+    camera3D.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+</script>
+</body>
+</html>
